@@ -1,4 +1,3 @@
-
-name: Tailscale with features app
-url: https://github.com/lmagyar/homeassistant-addon-tailscale
-maintainer: "@lmagyar"
+name: "Tailscale Auto-Updating Fork"
+url: "https://github.com/pkirby11-debug/homeassistant-addon-tailscale"
+maintainer: "Kevin Phillips"

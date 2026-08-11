@@ -1,9 +1,9 @@
 ---
-name: Tailscale with features
-version: 0.28.1.14
+name: Tailscale (Auto-Updating)
+version: 0.28.1.15
 slug: tailscale
 description: Zero config VPN for building secure networks
-url: https://github.com/lmagyar/homeassistant-addon-tailscale
+url: https://github.com/pkirby11-debug/homeassistant-addon-tailscale
 ingress: true
 ingress_port: 0
 ingress_stream: true
@@ -106,4 +106,3 @@ schema:
     packages: [str]
     init_commands: [str]
   userspace_networking: bool
-image: ghcr.io/lmagyar/{arch}-addon-tailscale
