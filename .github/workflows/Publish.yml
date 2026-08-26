@@ -31,8 +31,11 @@ jobs:
     - name: Publish
       uses: home-assistant/builder@2026.03.2
       with:
+        # `--image` is required because config.yaml has no `image:` key; without
+        # it the builder produces the invalid tag `ghcr.io/<owner>/:<version>`.
         args: |
           --${{ matrix.arch }} \
           --target tailscale \
           --cosign \
-          --docker-hub ghcr.io/${{ github.repository_owner }}
+          --image "{arch}-addon-tailscale" \
+          --docker-hub "ghcr.io/${{ github.repository_owner }}"
