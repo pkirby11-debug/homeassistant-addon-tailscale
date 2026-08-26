@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.1.16 (forked)
+
+- Update tailscale/tailscale to v1.102.3
+
 ## 0.28.1.14 (forked)
 
 - Release unreleased changes from community app

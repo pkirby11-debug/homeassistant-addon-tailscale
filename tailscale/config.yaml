@@ -1,6 +1,6 @@
 ---
 name: Tailscale (Auto-Updating)
-version: 0.28.1.15
+version: 0.28.1.16
 slug: tailscale
 description: Zero config VPN for building secure networks
 url: https://github.com/pkirby11-debug/homeassistant-addon-tailscale
