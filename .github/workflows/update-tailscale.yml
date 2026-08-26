@@ -111,6 +111,40 @@ jobs:
 
           echo "config_version=${NEW_CONFIG_VER}" >> "$GITHUB_OUTPUT"
 
+      # Build the updated add-on before committing, so a version that does not
+      # build never reaches main. The Supervisor builds this fork locally, so
+      # without this gate a bad pin is only discovered when the add-on fails to
+      # start.
+      #
+      # One arch per builder invocation, deliberately. builder.sh runs each arch
+      # as a background subshell and then `wait`s on all of them; with more than
+      # one PID, `wait` returns only the LAST one's status, so a failure in any
+      # other arch is swallowed and the builder exits 0. Its own BUILD_ERROR
+      # check cannot catch it either, because that array is populated inside the
+      # subshell and never reaches the parent. With a single PID the status
+      # propagates correctly under `set -e`.
+      - name: Test build (amd64)
+        if: steps.versions.outputs.changed == 'true'
+        uses: home-assistant/builder@2026.03.2
+        with:
+          args: |
+            --test \
+            --amd64 \
+            --target tailscale \
+            --image "{arch}-addon-tailscale" \
+            --docker-hub "ghcr.io/${{ github.repository_owner }}"
+
+      - name: Test build (aarch64)
+        if: steps.versions.outputs.changed == 'true'
+        uses: home-assistant/builder@2026.03.2
+        with:
+          args: |
+            --test \
+            --aarch64 \
+            --target tailscale \
+            --image "{arch}-addon-tailscale" \
+            --docker-hub "ghcr.io/${{ github.repository_owner }}"
+
       - name: Commit and Push Changes
         if: steps.versions.outputs.changed == 'true'
         run: |
@@ -128,6 +162,7 @@ jobs:
             if [ "${{ steps.versions.outputs.changed }}" = "true" ]; then
               echo "Updated Tailscale \`${{ steps.versions.outputs.current_version }}\` -> \`${{ steps.versions.outputs.latest_version }}\`"
               echo "Add-on version is now \`${{ steps.bump.outputs.config_version }}\`."
+              echo "Verified building on amd64 and aarch64 before committing."
             else
               echo "No update needed. Tailscale is pinned at \`${{ steps.versions.outputs.current_version }}\`."
             fi
