@@ -5,46 +5,165 @@ on:
     - cron: '0 6 * * *' # Daily at 06:00 UTC
   workflow_dispatch:
 
+# Required so the built-in GITHUB_TOKEN is allowed to push the version bump.
+# Without this the token is read-only and `git push` fails with HTTP 403.
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-update-tailscale
+  cancel-in-progress: false
+
 jobs:
   check-update:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          # Full history so the rebase before pushing works (the default is a
+          # shallow clone). persist-credentials must stay enabled (the default)
+          # so `git push` is authenticated.
+          fetch-depth: 0
 
-      - name: Get Latest Tailscale Release
-        id: latest_ts
+      - name: Resolve Tailscale versions
+        id: versions
         run: |
-          LATEST_TAG=$(curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | jq -r .tag_name)
-          echo "latest_version=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "Latest Tailscale version is $LATEST_TAG"
+          set -euo pipefail
 
-      - name: Get Current Configured Version in Dockerfile
-        id: current_ts
-        run: |
-          CURRENT_VER=$(grep -E 'ARG TAILSCALE_VERSION=' tailscale/Dockerfile | cut -d'"' -f2)
-          echo "current_version=$CURRENT_VER" >> $GITHUB_OUTPUT
-          echo "Current Dockerfile Tailscale version is $CURRENT_VER"
+          # Use the stable package channel rather than the GitHub "latest release".
+          # The Dockerfile downloads from https://pkgs.tailscale.com/stable/, and
+          # GitHub's latest release can point at an unstable build (odd minor
+          # version) that does not exist in that channel.
+          LATEST_NUM="$(curl -fsSL --retry 3 --retry-delay 5 \
+            'https://pkgs.tailscale.com/stable/?mode=json' | jq -r '.TarballsVersion')"
 
-      - name: Update Dockerfile and Config if New Version Available
-        if: steps.latest_ts.outputs.latest_version != steps.current_ts.outputs.current_version && steps.latest_ts.outputs.latest_version != ''
+          if ! [[ "${LATEST_NUM}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected version from the Tailscale stable channel: '${LATEST_NUM}'"
+            exit 1
+          fi
+          LATEST_VER="v${LATEST_NUM}"
+
+          CURRENT_VER="$(grep -oP '^ARG TAILSCALE_VERSION="\K[^"]+' tailscale/Dockerfile)"
+          CURRENT_NUM="${CURRENT_VER#v}"
+
+          echo "Stable Tailscale version : ${LATEST_VER}"
+          echo "Current Dockerfile pin   : ${CURRENT_VER}"
+
+          CHANGED=false
+          if [ "${CURRENT_NUM}" = "${LATEST_NUM}" ]; then
+            echo "Already up to date."
+          elif [ "$(printf '%s\n%s\n' "${CURRENT_NUM}" "${LATEST_NUM}" | sort -V | tail -1)" = "${LATEST_NUM}" ]; then
+            CHANGED=true
+          else
+            echo "::warning::Stable channel (${LATEST_VER}) is behind the pinned version (${CURRENT_VER}); not downgrading."
+          fi
+
+          {
+            echo "latest_version=${LATEST_VER}"
+            echo "current_version=${CURRENT_VER}"
+            echo "changed=${CHANGED}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the release tarballs exist
+        if: steps.versions.outputs.changed == 'true'
         run: |
-          NEW_VER="${{ steps.latest_ts.outputs.latest_version }}"
-          echo "Updating Tailscale version to $NEW_VER..."
-          
-          # Update Dockerfile
-          sed -i "s/ARG TAILSCALE_VERSION=.*/ARG TAILSCALE_VERSION=\"$NEW_VER\"/" tailscale/Dockerfile
-          
-          # Bump patch version in config.yaml
-          OLD_CONFIG_VER=$(grep -E '^version:' tailscale/config.yaml | awk '{print $2}')
-          NEW_CONFIG_VER=$(echo $OLD_CONFIG_VER | awk -F. '{$NF = $NF + 1; print $0}' OFS=.)
-          sed -i "s/^version: .*/version: $NEW_CONFIG_VER/" tailscale/config.yaml
+          set -euo pipefail
+          VER="${{ steps.versions.outputs.latest_version }}"
+          # The add-on is built locally by the Supervisor, so a bad pin breaks the
+          # add-on on the user's machine. Confirm both architectures are published.
+          for ARCH in amd64 arm64; do
+            URL="https://pkgs.tailscale.com/stable/tailscale_${VER#v}_${ARCH}.tgz"
+            echo "Checking ${URL}"
+            curl -fsIL --retry 3 --retry-delay 5 -o /dev/null "${URL}"
+          done
+
+      - name: Update Dockerfile, config and changelog
+        id: bump
+        if: steps.versions.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          NEW_VER="${{ steps.versions.outputs.latest_version }}"
+
+          sed -i "s|^ARG TAILSCALE_VERSION=.*|ARG TAILSCALE_VERSION=\"${NEW_VER}\"|" tailscale/Dockerfile
+          if git diff --quiet -- tailscale/Dockerfile; then
+            echo "::error::Dockerfile was not modified; the TAILSCALE_VERSION line may have changed format."
+            exit 1
+          fi
+
+          # Bump the last component of the add-on version so Home Assistant offers an update.
+          OLD_CONFIG_VER="$(grep -oP '^version:\s*\K\S+' tailscale/config.yaml)"
+          NEW_CONFIG_VER="$(echo "${OLD_CONFIG_VER}" | awk -F. '{$NF = $NF + 1; print $0}' OFS=.)"
+          sed -i "s|^version: .*|version: ${NEW_CONFIG_VER}|" tailscale/config.yaml
+          echo "Add-on version ${OLD_CONFIG_VER} -> ${NEW_CONFIG_VER}"
+
+          # Prepend a changelog entry (shown by Home Assistant on the update screen).
+          TMP="$(mktemp)"
+          {
+            echo "# Changelog"
+            echo
+            echo "## ${NEW_CONFIG_VER} (forked)"
+            echo
+            echo "- Update tailscale/tailscale to ${NEW_VER}"
+            tail -n +2 tailscale/CHANGELOG.md
+          } > "${TMP}"
+          mv "${TMP}" tailscale/CHANGELOG.md
+
+          echo "config_version=${NEW_CONFIG_VER}" >> "$GITHUB_OUTPUT"
+
+      # Build the updated add-on before committing, so a version that does not
+      # build never reaches main. The Supervisor builds this fork locally, so
+      # without this gate a bad pin is only discovered when the add-on fails to
+      # start.
+      #
+      # One arch per builder invocation, deliberately. builder.sh runs each arch
+      # as a background subshell and then `wait`s on all of them; with more than
+      # one PID, `wait` returns only the LAST one's status, so a failure in any
+      # other arch is swallowed and the builder exits 0. Its own BUILD_ERROR
+      # check cannot catch it either, because that array is populated inside the
+      # subshell and never reaches the parent. With a single PID the status
+      # propagates correctly under `set -e`.
+      - name: Test build (amd64)
+        if: steps.versions.outputs.changed == 'true'
+        uses: home-assistant/builder@2026.03.2
+        with:
+          args: |
+            --test \
+            --amd64 \
+            --target tailscale \
+            --image "{arch}-addon-tailscale" \
+            --docker-hub "ghcr.io/${{ github.repository_owner }}"
+
+      - name: Test build (aarch64)
+        if: steps.versions.outputs.changed == 'true'
+        uses: home-assistant/builder@2026.03.2
+        with:
+          args: |
+            --test \
+            --aarch64 \
+            --target tailscale \
+            --image "{arch}-addon-tailscale" \
+            --docker-hub "ghcr.io/${{ github.repository_owner }}"
 
       - name: Commit and Push Changes
-        if: steps.latest_ts.outputs.latest_version != steps.current_ts.outputs.current_version && steps.latest_ts.outputs.latest_version != ''
+        if: steps.versions.outputs.changed == 'true'
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add tailscale/Dockerfile tailscale/config.yaml
-          git commit -m "bump: update Tailscale to ${{ steps.latest_ts.outputs.latest_version }}"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tailscale/Dockerfile tailscale/config.yaml tailscale/CHANGELOG.md
+          git commit -m "bump: update Tailscale to ${{ steps.versions.outputs.latest_version }}"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Summary
+        run: |
+          {
+            if [ "${{ steps.versions.outputs.changed }}" = "true" ]; then
+              echo "Updated Tailscale \`${{ steps.versions.outputs.current_version }}\` -> \`${{ steps.versions.outputs.latest_version }}\`"
+              echo "Add-on version is now \`${{ steps.bump.outputs.config_version }}\`."
+              echo "Verified building on amd64 and aarch64 before committing."
+            else
+              echo "No update needed. Tailscale is pinned at \`${{ steps.versions.outputs.current_version }}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
