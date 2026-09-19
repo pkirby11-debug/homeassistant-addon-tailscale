@@ -62,15 +62,31 @@ def read_pins(dockerfile: Path) -> dict[str, str]:
     return pins
 
 
+def _run(cmd: list[str], what: str) -> subprocess.CompletedProcess:
+    """Run a command, failing with the actual output rather than just a code."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"error: failed to {what} (exit {proc.returncode})\n"
+            f"  command: {' '.join(cmd)}\n"
+            f"  stdout : {proc.stdout.strip() or '<empty>'}\n"
+            f"  stderr : {proc.stderr.strip() or '<empty>'}"
+        )
+    return proc
+
+
 def query_available(image: str, packages: list[str]) -> str:
-    subprocess.run(["docker", "pull", "--quiet", image], check=True, stdout=subprocess.DEVNULL)
+    _run(["docker", "pull", "--quiet", image], f"pull {image}")
+    # The base image sets ENTRYPOINT ["/init"] (s6-overlay), so a bare
+    # `docker run <image> apk ...` hands the arguments to s6 instead of running
+    # apk, and the command fails. Override the entrypoint to invoke apk directly.
+    #
     # `apk search -x` is an exact-name match, so "nginx" cannot match
     # "nginx-module-*" and each requested package yields at most one line.
-    proc = subprocess.run(
-        ["docker", "run", "--rm", image, "apk", "search", "--no-cache", "-x", *packages],
-        check=True,
-        capture_output=True,
-        text=True,
+    proc = _run(
+        ["docker", "run", "--rm", "--entrypoint", "apk", image,
+         "search", "--no-cache", "-x", *packages],
+        f"query package versions from {image}",
     )
     return proc.stdout
 
