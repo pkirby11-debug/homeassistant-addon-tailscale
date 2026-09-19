@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: Resolve Tailscale versions
-        id: versions
+        id: tailscale
         run: |
           set -euo pipefail
 
@@ -66,32 +66,74 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Verify the release tarballs exist
-        if: steps.versions.outputs.changed == 'true'
+        if: steps.tailscale.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          VER="${{ steps.versions.outputs.latest_version }}"
           # The add-on is built locally by the Supervisor, so a bad pin breaks the
           # add-on on the user's machine. Confirm both architectures are published.
+          # This is a fast fail: it reports a missing release far more clearly
+          # than the docker build further down would.
           for ARCH in amd64 arm64; do
             URL="https://pkgs.tailscale.com/stable/tailscale_${VER#v}_${ARCH}.tgz"
             echo "Checking ${URL}"
             curl -fsIL --retry 3 --retry-delay 5 -o /dev/null "${URL}"
           done
+        env:
+          VER: ${{ steps.tailscale.outputs.latest_version }}
 
-      - name: Update Dockerfile, config and changelog
-        id: bump
-        if: steps.versions.outputs.changed == 'true'
+      # Runs on every invocation, not just when Tailscale moved. Alpine drops
+      # older package revisions as things are rebuilt, so an exact pin that was
+      # valid when written eventually stops resolving and the add-on no longer
+      # builds. Checking daily surfaces that within a day instead of leaving it
+      # to ambush the next Tailscale release.
+      - name: Refresh stale Alpine package pins
+        id: pins
+        run: python3 .github/scripts/refresh-apk-pins.py
+
+      - name: Decide whether anything changed
+        id: changes
         run: |
           set -euo pipefail
-          NEW_VER="${{ steps.versions.outputs.latest_version }}"
+          if [ "${TS_CHANGED}" = "true" ] || [ "${PINS_CHANGED}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          TS_CHANGED: ${{ steps.tailscale.outputs.changed }}
+          PINS_CHANGED: ${{ steps.pins.outputs.changed }}
 
-          sed -i "s|^ARG TAILSCALE_VERSION=.*|ARG TAILSCALE_VERSION=\"${NEW_VER}\"|" tailscale/Dockerfile
-          if git diff --quiet -- tailscale/Dockerfile; then
-            echo "::error::Dockerfile was not modified; the TAILSCALE_VERSION line may have changed format."
-            exit 1
+      - name: Apply updates
+        id: bump
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          NOTES=()
+          SUBJECT=""
+
+          if [ "${TS_CHANGED}" = "true" ]; then
+            sed -i "s|^ARG TAILSCALE_VERSION=.*|ARG TAILSCALE_VERSION=\"${TS_VERSION}\"|" tailscale/Dockerfile
+            # The pin refresh above may already have touched the Dockerfile, so
+            # assert on content rather than on "the file changed".
+            if ! grep -q "^ARG TAILSCALE_VERSION=\"${TS_VERSION}\"\$" tailscale/Dockerfile; then
+              echo "::error::Dockerfile was not modified; the TAILSCALE_VERSION line may have changed format."
+              exit 1
+            fi
+            NOTES+=("- Update tailscale/tailscale to ${TS_VERSION}")
+            SUBJECT="bump: update Tailscale to ${TS_VERSION}"
           fi
 
-          # Bump the last component of the add-on version so Home Assistant offers an update.
+          if [ "${PINS_CHANGED}" = "true" ]; then
+            NOTES+=("- Refresh Alpine package pins: ${PINS_SUMMARY}")
+            if [ -z "${SUBJECT}" ]; then
+              SUBJECT="chore: refresh Alpine package pins"
+            fi
+          fi
+
+          # Bump the last component of the add-on version so Home Assistant offers
+          # an update. A pin refresh changes the built image too, so it earns a
+          # version bump just as a Tailscale change does.
           OLD_CONFIG_VER="$(grep -oP '^version:\s*\K\S+' tailscale/config.yaml)"
           NEW_CONFIG_VER="$(echo "${OLD_CONFIG_VER}" | awk -F. '{$NF = $NF + 1; print $0}' OFS=.)"
           sed -i "s|^version: .*|version: ${NEW_CONFIG_VER}|" tailscale/config.yaml
@@ -104,66 +146,110 @@ jobs:
             echo
             echo "## ${NEW_CONFIG_VER} (forked)"
             echo
-            echo "- Update tailscale/tailscale to ${NEW_VER}"
+            printf '%s\n' "${NOTES[@]}"
             tail -n +2 tailscale/CHANGELOG.md
           } > "${TMP}"
           mv "${TMP}" tailscale/CHANGELOG.md
 
-          echo "config_version=${NEW_CONFIG_VER}" >> "$GITHUB_OUTPUT"
+          {
+            echo "config_version=${NEW_CONFIG_VER}"
+            echo "subject=${SUBJECT}"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          TS_CHANGED: ${{ steps.tailscale.outputs.changed }}
+          TS_VERSION: ${{ steps.tailscale.outputs.latest_version }}
+          PINS_CHANGED: ${{ steps.pins.outputs.changed }}
+          PINS_SUMMARY: ${{ steps.pins.outputs.summary }}
+
+      - name: Resolve base images
+        id: base
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          for ARCH in amd64 aarch64; do
+            BUILD_FROM="$(awk -v key="${ARCH}:" '
+              /^build_from:/ { inblock = 1; next }
+              /^[^[:space:]]/ { inblock = 0 }
+              inblock && $1 == key { print $2; exit }
+            ' tailscale/build.yaml)"
+            if [ -z "${BUILD_FROM}" ]; then
+              echo "::error::No build_from entry for ${ARCH} in tailscale/build.yaml"
+              exit 1
+            fi
+            echo "${ARCH}=${BUILD_FROM}" >> "$GITHUB_OUTPUT"
+            echo "${ARCH}: ${BUILD_FROM}"
+          done
 
       # Build the updated add-on before committing, so a version that does not
       # build never reaches main. The Supervisor builds this fork locally, so
       # without this gate a bad pin is only discovered when the add-on fails to
-      # start.
-      #
-      # One arch per builder invocation, deliberately. builder.sh runs each arch
-      # as a background subshell and then `wait`s on all of them; with more than
-      # one PID, `wait` returns only the LAST one's status, so a failure in any
-      # other arch is swallowed and the builder exits 0. Its own BUILD_ERROR
-      # check cannot catch it either, because that array is populated inside the
-      # subshell and never reaches the parent. With a single PID the status
-      # propagates correctly under `set -e`.
+      # start on the user's machine.
+      - name: Set up QEMU
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v4
+
       - name: Test build (amd64)
-        if: steps.versions.outputs.changed == 'true'
-        uses: home-assistant/builder@2026.03.2
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
         with:
-          args: |
-            --test \
-            --amd64 \
-            --target tailscale \
-            --image "{arch}-addon-tailscale" \
-            --docker-hub "ghcr.io/${{ github.repository_owner }}"
+          context: tailscale
+          file: tailscale/Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BUILD_FROM=${{ steps.base.outputs.amd64 }}
+            BUILD_ARCH=amd64
 
       - name: Test build (aarch64)
-        if: steps.versions.outputs.changed == 'true'
-        uses: home-assistant/builder@2026.03.2
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
         with:
-          args: |
-            --test \
-            --aarch64 \
-            --target tailscale \
-            --image "{arch}-addon-tailscale" \
-            --docker-hub "ghcr.io/${{ github.repository_owner }}"
+          context: tailscale
+          file: tailscale/Dockerfile
+          platforms: linux/arm64
+          push: false
+          build-args: |
+            BUILD_FROM=${{ steps.base.outputs.aarch64 }}
+            BUILD_ARCH=aarch64
 
       - name: Commit and Push Changes
-        if: steps.versions.outputs.changed == 'true'
+        if: steps.changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tailscale/Dockerfile tailscale/config.yaml tailscale/CHANGELOG.md
-          git commit -m "bump: update Tailscale to ${{ steps.versions.outputs.latest_version }}"
+          git commit -m "${SUBJECT}"
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+        env:
+          SUBJECT: ${{ steps.bump.outputs.subject }}
 
       - name: Summary
         run: |
           {
-            if [ "${{ steps.versions.outputs.changed }}" = "true" ]; then
-              echo "Updated Tailscale \`${{ steps.versions.outputs.current_version }}\` -> \`${{ steps.versions.outputs.latest_version }}\`"
-              echo "Add-on version is now \`${{ steps.bump.outputs.config_version }}\`."
-              echo "Verified building on amd64 and aarch64 before committing."
+            if [ "${CHANGED}" != "true" ]; then
+              echo "No update needed. Tailscale is pinned at \`${TS_CURRENT}\`, Alpine pins are current."
             else
-              echo "No update needed. Tailscale is pinned at \`${{ steps.versions.outputs.current_version }}\`."
+              if [ "${TS_CHANGED}" = "true" ]; then
+                echo "- Tailscale \`${TS_CURRENT}\` -> \`${TS_VERSION}\`"
+              fi
+              if [ "${PINS_CHANGED}" = "true" ]; then
+                echo "- Alpine pins refreshed: ${PINS_SUMMARY}"
+              fi
+              echo "- Add-on version is now \`${CONFIG_VERSION}\`"
+              echo "- Verified building on amd64 and aarch64 before committing."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          CHANGED: ${{ steps.changes.outputs.changed }}
+          TS_CHANGED: ${{ steps.tailscale.outputs.changed }}
+          TS_CURRENT: ${{ steps.tailscale.outputs.current_version }}
+          TS_VERSION: ${{ steps.tailscale.outputs.latest_version }}
+          PINS_CHANGED: ${{ steps.pins.outputs.changed }}
+          PINS_SUMMARY: ${{ steps.pins.outputs.summary }}
+          CONFIG_VERSION: ${{ steps.bump.outputs.config_version }}
