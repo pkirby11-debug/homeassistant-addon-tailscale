@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.1.19 (forked)
+
+- Update tailscale/tailscale to v1.102.5
+
 ## 0.28.1.18 (forked)
 
 - Refresh Alpine package pins: bind-tools 9.20.27-r0 -> 9.20.29-r0
