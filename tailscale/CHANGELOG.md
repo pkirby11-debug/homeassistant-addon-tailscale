@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.1.20 (forked)
+
+- Update tailscale/tailscale to v1.104.1
+
 ## 0.28.1.19 (forked)
 
 - Update tailscale/tailscale to v1.102.5
