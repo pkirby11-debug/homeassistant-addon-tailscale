@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.1.23 (forked)
+
+- Refresh Alpine package pins: bind-tools 9.20.29-r0 -> 9.20.30-r0
+
 ## 0.28.1.22 (forked)
 
 - Refresh Alpine package pins: nginx 1.30.4-r1 -> 1.30.6-r0
